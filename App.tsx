@@ -1,392 +1,638 @@
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { 
-  ShieldAlert, 
-  LayoutDashboard, 
-  Database, 
-  Users, 
-  TrendingUp, 
-  ShieldCheck,
-  AlertTriangle,
-  History,
-  Lock,
-  PlusCircle,
-  EyeOff,
-  Terminal,
-  Server,
-  Activity
+  Video, 
+  VideoOff, 
+  Mic, 
+  MicOff, 
+  PhoneOff, 
+  MessageSquare, 
+  Settings, 
+  Maximize2,
+  Sparkles,
+  Users,
+  Activity,
+  X,
+  Sliders,
+  CircleStop,
+  Radio,
+  AlertCircle,
+  Globe,
+  Languages,
+  EarOff,
+  Ear,
+  Type as TypeIcon,
+  Loader2
 } from 'lucide-react';
-import { 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer, 
-  AreaChart, 
-  Area,
-  PieChart,
-  Pie,
-  Cell
-} from 'recharts';
-import { BankStats, ViewState, Transaction, AnalysisResponse } from './types';
-import { analyzeFederatedData, predictFraudProbability } from './services/geminiService';
-import { encryptValue, splitIntoShares, reconstructFromShares } from './utils/crypto';
+import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
+import { encode, decode, decodeAudioData } from './utils/audio';
+import { transcribeAudio } from './services/geminiService';
+
+const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const TRANSLATION_MODEL = 'gemini-3-flash-preview';
+const INPUT_SAMPLE_RATE = 16000;
+const OUTPUT_SAMPLE_RATE = 24000;
+
+interface TranscriptEntry {
+  id: string;
+  role: 'user' | 'model' | 'system';
+  text: string;
+  englishTranslation?: string;
+  isTranscription?: boolean;
+}
 
 export default function App() {
-  const [activeView, setActiveView] = useState<ViewState>('dashboard');
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [terminalLogs, setTerminalLogs] = useState<string[]>(["[SYSTEM] Initialized secure computation environment..."]);
-  
-  // Form State
-  const [amount, setAmount] = useState<string>('');
-  const [riskScore, setRiskScore] = useState<number>(15);
+  const [isActive, setIsActive] = useState(false);
+  const [isMicOn, setIsMicOn] = useState(true);
+  const [isCamOn, setIsCamOn] = useState(true);
+  const [showTranscript, setShowTranscript] = useState(true);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<{id: number, msg: string}[]>([]);
 
-  const addLog = (msg: string) => {
-    setTerminalLogs(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 50));
+  // Recording State
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+
+  // Transcription State (Gemini 3 Flash)
+  const [isDictating, setIsDictating] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const dictationRecorderRef = useRef<MediaRecorder | null>(null);
+  const dictationChunksRef = useRef<Blob[]>([]);
+
+  // Audio Processing State
+  const [isNoiseCancellationEnabled, setIsNoiseCancellationEnabled] = useState(true);
+
+  // Translation State - Specifically for "Any to English"
+  const [isTranslationEnabled, setIsTranslationEnabled] = useState(true);
+
+  // Streaming Configuration State
+  const [frameRate, setFrameRate] = useState(1);
+  const [jpegQuality, setJpegQuality] = useState(0.5);
+
+  // Refs for media and session
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const sessionRef = useRef<any>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const frameIntervalRef = useRef<number | null>(null);
+  
+  // Audio Refs
+  const inputAudioCtxRef = useRef<AudioContext | null>(null);
+  const outputAudioCtxRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const outputGainRef = useRef<GainNode | null>(null);
+
+  // Transcription accumulators
+  const currentUserInputRef = useRef('');
+  const currentModelOutputRef = useRef('');
+
+  const addAlert = (msg: string) => {
+    const id = Date.now();
+    setAlerts(prev => [...prev, { id, msg }]);
+    setTimeout(() => setAlerts(prev => prev.filter(a => a.id !== id)), 5000);
   };
 
-  const handleTransaction = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!amount || isProcessing) return;
+  // Screenshot Detection
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'PrintScreen' || (e.ctrlKey && e.key === 'p')) {
+        addAlert("Screenshot detected! Admin notified.");
+      }
+    };
 
-    setIsProcessing(true);
-    const amtNum = parseFloat(amount);
-    
-    addLog(`INITIATING TRANSACTION: $${amtNum}`);
-    
-    // 1. Blinding & Encryption (Frontend/Client Side)
-    addLog("PHASE 1: Client-side blinding...");
-    const encryptedAmt = encryptValue(amtNum);
-    const shares = splitIntoShares(amtNum, 3);
-    addLog(`ENCRYPTED PACKET GENERATED: ${encryptedAmt.substring(0, 15)}...`);
-    addLog(`SMPC SHARES DISTRIBUTED TO 3 NODES: [${shares.map(s => s.partyId).join(', ')}]`);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden' && isActive) {
+        addAlert("Security Warning: Window focus lost.");
+      }
+    };
 
-    // 2. Simulated Transmission & Secure Reconstruction (Secure Zone)
-    addLog("PHASE 2: Transmitting shares via encrypted tunnel...");
-    await new Promise(r => setTimeout(r, 1000));
-    const reconstructed = reconstructFromShares(shares);
-    addLog("PHASE 3: Secure Multi-Party Aggregation complete. Passing features to ML engine.");
+    window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isActive]);
 
-    // 3. ML Prediction (Insecure/Analysis Zone but using privacy data)
-    try {
-      const prediction = await predictFraudProbability(reconstructed, riskScore);
-      addLog(`ML INFERENCE RESULT: ${prediction.isFraud ? 'FRAUD DETECTED' : 'NORMAL'} (${(prediction.probability * 100).toFixed(1)}%)`);
-
-      const newTx: Transaction = {
-        id: `TX-${Math.random().toString(36).substr(2, 9).toUpperCase()}`,
-        timestamp: Date.now(),
-        amount: amtNum,
-        deviceRiskScore: riskScore,
-        location: 'Remote API',
-        isFraud: prediction.isFraud,
-        probability: prediction.probability,
-        status: 'Completed'
-      };
-
-      setTransactions([newTx, ...transactions]);
-      setAmount('');
-      setActiveView('transactions');
-    } catch (error) {
-      addLog("ERROR: Analysis node timeout.");
-    } finally {
-      setIsProcessing(false);
+  const toggleNoiseCancellation = async (enabled: boolean) => {
+    setIsNoiseCancellationEnabled(enabled);
+    if (mediaStreamRef.current) {
+      const audioTrack = mediaStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        try {
+          await audioTrack.applyConstraints({
+            noiseSuppression: enabled,
+            echoCancellation: enabled,
+            autoGainControl: enabled
+          });
+          addAlert(`Noise Cancellation ${enabled ? 'Enabled' : 'Disabled'}`);
+        } catch (e) {
+          console.error("Failed to apply audio constraints", e);
+        }
+      }
     }
   };
 
-  const stats = useMemo(() => {
-    const fraudCount = transactions.filter(t => t.isFraud).length;
-    const normalCount = transactions.length - fraudCount;
-    return [
-      { name: 'Fraud', value: fraudCount, color: '#ef4444' },
-      { name: 'Normal', value: normalCount, color: '#10b981' },
-    ];
-  }, [transactions]);
+  /**
+   * Dictation Feature using Gemini 3 Flash
+   */
+  const startDictation = async () => {
+    try {
+      const stream = mediaStreamRef.current || await navigator.mediaDevices.getUserMedia({ audio: true });
+      dictationChunksRef.current = [];
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) dictationChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        setIsTranscribing(true);
+        const blob = new Blob(dictationChunksRef.current, { type: 'audio/webm' });
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          const base64Data = (reader.result as string).split(',')[1];
+          try {
+            const transcriptText = await transcribeAudio(base64Data, 'audio/webm');
+            setTranscript(prev => [...prev, { 
+              id: Date.now() + '-t', 
+              role: 'user', 
+              text: transcriptText, 
+              isTranscription: true 
+            }]);
+          } catch (err) {
+            addAlert("Transcription failed. Please try again.");
+          } finally {
+            setIsTranscribing(false);
+          }
+        };
+        reader.readAsDataURL(blob);
+      };
+
+      dictationRecorderRef.current = recorder;
+      recorder.start();
+      setIsDictating(true);
+      addAlert("Dictation started...");
+    } catch (err) {
+      console.error("Dictation error:", err);
+      addAlert("Microphone access denied for dictation.");
+    }
+  };
+
+  const stopDictation = () => {
+    if (dictationRecorderRef.current && dictationRecorderRef.current.state !== 'inactive') {
+      dictationRecorderRef.current.stop();
+      setIsDictating(false);
+    }
+  };
+
+  /**
+   * Translates any input language to English using Gemini 3 Flash.
+   */
+  const translateToEnglish = async (text: string) => {
+    if (!text || !isTranslationEnabled) return null;
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const response = await ai.models.generateContent({
+        model: TRANSLATION_MODEL,
+        contents: `Act as a real-time translator. Translate the following text to English. If it is already in English, return the word "SKIP". Otherwise, return ONLY the English translation. Text: "${text}"`,
+      });
+      const result = response.text?.trim() || "";
+      return result === "SKIP" ? null : result;
+    } catch (e) {
+      console.error("Translation to English failed", e);
+      return null;
+    }
+  };
+
+  const startRecording = async () => {
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      recordedChunksRef.current = [];
+      const recorder = new MediaRecorder(screenStream, { mimeType: 'video/webm;codecs=vp9' });
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = `Aether-Recording-${new Date().toISOString()}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        setIsRecording(false);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+      addAlert("Screen recording active.");
+    } catch (err) {
+      console.error("Recording error:", err);
+      setSessionError("Recording permissions not granted.");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
+    }
+  };
+
+  const stopSession = useCallback(() => {
+    setIsActive(false);
+    if (sessionRef.current) {
+      sessionRef.current.close();
+      sessionRef.current = null;
+    }
+    if (frameIntervalRef.current) {
+      window.clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+    audioSourcesRef.current.forEach(source => source.stop());
+    audioSourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+  }, []);
+
+  useEffect(() => {
+    if (!isActive || !isCamOn) {
+      if (frameIntervalRef.current) {
+        window.clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
+      return;
+    }
+    if (frameIntervalRef.current) window.clearInterval(frameIntervalRef.current);
+
+    frameIntervalRef.current = window.setInterval(() => {
+      if (!localVideoRef.current || !canvasRef.current || !sessionRef.current) return;
+      const video = localVideoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (ctx && video.videoWidth > 0) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        canvas.toBlob(async (blob) => {
+          if (blob) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const base64Data = (reader.result as string).split(',')[1];
+              if (sessionRef.current) {
+                sessionRef.current.sendRealtimeInput({
+                  media: { data: base64Data, mimeType: 'image/jpeg' }
+                });
+              }
+            };
+            reader.readAsDataURL(blob);
+          }
+        }, 'image/jpeg', jpegQuality);
+      }
+    }, 1000 / frameRate);
+
+    return () => {
+      if (frameIntervalRef.current) window.clearInterval(frameIntervalRef.current);
+    };
+  }, [isActive, isCamOn, frameRate, jpegQuality]);
+
+  const startSession = async () => {
+    setSessionError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          noiseSuppression: isNoiseCancellationEnabled, 
+          echoCancellation: true, 
+          autoGainControl: true 
+        }, 
+        video: true 
+      });
+      mediaStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      inputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
+      outputAudioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: OUTPUT_SAMPLE_RATE });
+      outputGainRef.current = outputAudioCtxRef.current.createGain();
+      outputGainRef.current.connect(outputAudioCtxRef.current.destination);
+
+      const sessionPromise = ai.live.connect({
+        model: MODEL_NAME,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: `You are an advanced AI companion in a video conference. You can understand multiple languages but you should respond naturally. Your transcriptions will be automatically translated to English for the user.`
+        },
+        callbacks: {
+          onopen: () => {
+            setIsActive(true);
+            const source = inputAudioCtxRef.current!.createMediaStreamSource(stream);
+            const scriptProcessor = inputAudioCtxRef.current!.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              if (!isMicOn) return;
+              const inputData = e.inputBuffer.getChannelData(0);
+              const int16 = new Int16Array(inputData.length);
+              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              const pcmBase64 = encode(new Uint8Array(int16.buffer));
+              sessionPromise.then(s => s.sendRealtimeInput({ media: { data: pcmBase64, mimeType: 'audio/pcm;rate=16000' } }));
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(inputAudioCtxRef.current!.destination);
+          },
+          onmessage: async (msg: LiveServerMessage) => {
+            const audioData = msg.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (audioData && outputAudioCtxRef.current) {
+              const ctx = outputAudioCtxRef.current;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              const buffer = await decodeAudioData(decode(audioData), ctx, OUTPUT_SAMPLE_RATE, 1);
+              const source = ctx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(outputGainRef.current!);
+              source.addEventListener('ended', () => audioSourcesRef.current.delete(source));
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += buffer.duration;
+              audioSourcesRef.current.add(source);
+            }
+            if (msg.serverContent?.interrupted) {
+              audioSourcesRef.current.forEach(s => s.stop());
+              audioSourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+            if (msg.serverContent?.inputTranscription) currentUserInputRef.current += msg.serverContent.inputTranscription.text;
+            if (msg.serverContent?.outputTranscription) currentModelOutputRef.current += msg.serverContent.outputTranscription.text;
+            
+            if (msg.serverContent?.turnComplete) {
+              const userText = currentUserInputRef.current;
+              const modelText = currentModelOutputRef.current;
+              
+              if (userText) {
+                const english = await translateToEnglish(userText);
+                setTranscript(prev => [...prev, { id: Date.now() + '-u', role: 'user', text: userText, englishTranslation: english || undefined }]);
+              }
+              if (modelText) {
+                const english = await translateToEnglish(modelText);
+                setTranscript(prev => [...prev, { id: Date.now() + '-m', role: 'model', text: modelText, englishTranslation: english || undefined }]);
+              }
+              currentUserInputRef.current = '';
+              currentModelOutputRef.current = '';
+            }
+          },
+          onerror: (e) => {
+            console.error('API Error:', e);
+            setSessionError('Network error occurred.');
+            stopSession();
+          },
+          onclose: () => setIsActive(false)
+        }
+      });
+      sessionRef.current = await sessionPromise;
+    } catch (err) {
+      console.error('Failed to start session:', err);
+      setSessionError('Camera/Microphone access failed.');
+    }
+  };
 
   return (
-    <div className="flex min-h-screen bg-slate-950 text-slate-200">
-      {/* Sidebar */}
-      <nav className="w-64 border-r border-slate-800 bg-slate-900/50 flex flex-col p-6 sticky top-0 h-screen">
-        <div className="flex items-center gap-3 mb-10">
-          <div className="bg-indigo-600 p-2 rounded-lg">
-            <ShieldAlert size={24} className="text-white" />
-          </div>
-          <h1 className="text-xl font-bold tracking-tight text-white">SENTINEL v2</h1>
-        </div>
+    <div className="flex h-screen w-screen overflow-hidden bg-[#020617] relative">
+      <canvas ref={canvasRef} className="hidden" />
 
-        <div className="flex-1 space-y-2">
-          <NavItem icon={<LayoutDashboard size={20} />} label="Dashboard" active={activeView === 'dashboard'} onClick={() => setActiveView('dashboard')} />
-          <NavItem icon={<History size={20} />} label="Transactions" active={activeView === 'transactions'} onClick={() => setActiveView('transactions')} />
-          <NavItem icon={<Terminal size={20} />} label="SMPC Logs" active={activeView === 'terminal'} onClick={() => setActiveView('terminal')} />
-          <NavItem icon={<Users size={20} />} label="Nodes" active={activeView === 'collaboration'} onClick={() => setActiveView('collaboration')} />
-        </div>
-
-        <div className="mt-auto pt-6 border-t border-slate-800">
-          <div className="p-4 bg-slate-800/50 rounded-xl border border-slate-700">
-             <div className="flex items-center gap-2 text-xs text-indigo-400 font-bold mb-2 uppercase tracking-widest">
-                <Lock size={12} /> Privacy Status
-             </div>
-             <p className="text-[10px] text-slate-400">Zero-Knowledge Proofs (ZKP) and SMPC are active for all outbound traffic.</p>
+      {/* Alert Toasts */}
+      <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-2 w-full max-w-sm">
+        {alerts.map(alert => (
+          <div key={alert.id} className="bg-indigo-600/90 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-top duration-300 border border-white/20 backdrop-blur-md">
+            <Sparkles size={20} className="text-indigo-300" />
+            <span className="text-sm font-bold">{alert.msg}</span>
           </div>
-        </div>
-      </nav>
+        ))}
+      </div>
 
-      {/* Main Content */}
-      <main className="flex-1 p-8 overflow-y-auto">
-        <header className="flex justify-between items-center mb-10">
-          <div>
-            <h2 className="text-3xl font-bold text-white tracking-tight capitalize">{activeView}</h2>
-            <p className="text-slate-400 mt-1">Advanced Multi-Party Fraud Analytics Engine</p>
+      <div className="flex-1 flex flex-col relative">
+        <header className="p-4 flex justify-between items-center z-20">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-indigo-600 rounded-lg shadow-lg shadow-indigo-500/20">
+              <Sparkles className="text-white h-5 w-5" />
+            </div>
+            <h1 className="text-xl font-bold tracking-tight text-white/90">AETHER</h1>
           </div>
-          <div className="flex gap-4">
-             <div className="flex flex-col items-end">
-                <span className="text-[10px] text-slate-500 uppercase font-bold tracking-tighter">API Status</span>
-                <span className="text-sm font-semibold text-emerald-400 flex items-center gap-1">
-                   <Activity size={14} /> Operational
-                </span>
-             </div>
+          <div className="flex items-center gap-4 glass px-4 py-2 rounded-full">
+            <div className="flex items-center gap-2">
+              <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-xs font-medium text-emerald-400">Secure AI Node</span>
+            </div>
+            {isNoiseCancellationEnabled && (
+              <>
+                <div className="h-4 w-px bg-white/10" />
+                <div className="flex items-center gap-1.5 text-indigo-400 text-xs font-bold">
+                  <Ear size={12} />
+                  <span>Noise Filter Active</span>
+                </div>
+              </>
+            )}
           </div>
         </header>
 
-        {activeView === 'dashboard' && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            {/* Left: Transaction Form */}
-            <div className="lg:col-span-1 space-y-6">
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-                <h3 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
-                   <PlusCircle size={20} className="text-indigo-400" /> New Secured Transaction
-                </h3>
-                <form onSubmit={handleTransaction} className="space-y-4">
-                   <div>
-                      <label className="text-xs font-bold text-slate-500 uppercase mb-2 block tracking-wider">Transaction Amount ($)</label>
-                      <input 
-                        type="number" 
-                        value={amount}
-                        onChange={e => setAmount(e.target.value)}
-                        placeholder="0.00"
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all text-white font-mono text-lg"
-                      />
-                   </div>
-                   <div>
-                      <label className="text-xs font-bold text-slate-500 uppercase mb-2 block tracking-wider">Device Risk Score (0-100)</label>
-                      <input 
-                        type="range" 
-                        min="0" max="100"
-                        value={riskScore}
-                        onChange={e => setRiskScore(parseInt(e.target.value))}
-                        className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-                      />
-                      <div className="flex justify-between mt-2 text-xs font-mono text-slate-400">
-                         <span>Low Risk</span>
-                         <span className="text-indigo-400 font-bold">{riskScore}%</span>
-                         <span>Critical</span>
+        <div className="flex-1 flex items-center justify-center p-8 relative">
+          <div className="w-full max-w-5xl aspect-video rounded-3xl overflow-hidden glass glow-border relative group">
+            {!isActive ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6 space-y-6">
+                <Activity size={48} className="text-indigo-500 animate-pulse" />
+                <h2 className="text-3xl font-bold text-white tracking-tight">AI Virtual Environment</h2>
+                {sessionError && <div className="text-red-400 bg-red-400/10 px-4 py-2 rounded-lg border border-red-400/20 text-sm">{sessionError}</div>}
+                <button onClick={startSession} className="px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-2xl flex items-center gap-2 shadow-xl shadow-indigo-600/30 transition-all active:scale-95">
+                  <Video size={20} /> Initialize Session
+                </button>
+              </div>
+            ) : (
+              <div className="absolute inset-0 bg-[#0f172a] flex flex-col items-center justify-center overflow-hidden">
+                <div className="h-40 w-40 rounded-full bg-indigo-600/10 flex items-center justify-center animate-pulse border-4 border-indigo-500/20">
+                  <Sparkles size={64} className="text-indigo-400" />
+                </div>
+                <div className="absolute bottom-10 left-0 right-0 h-16 flex items-center justify-center gap-1 opacity-50">
+                  {Array.from({ length: 20 }).map((_, i) => (
+                    <div key={i} className="w-1 bg-indigo-500 rounded-full animate-wave" style={{ height: `${Math.random() * 100}%`, animationDelay: `${i * 0.05}s` }} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className={`absolute bottom-6 right-6 w-48 aspect-video rounded-xl overflow-hidden glass border border-white/10 transition-all shadow-2xl ${!isCamOn ? 'bg-slate-900' : ''}`}>
+              <video ref={localVideoRef} autoPlay muted playsInline className={`w-full h-full object-cover transform scale-x-[-1] ${!isCamOn ? 'hidden' : ''}`} />
+              {!isCamOn && <div className="absolute inset-0 flex items-center justify-center"><VideoOff size={24} className="text-white/20" /></div>}
+            </div>
+          </div>
+        </div>
+
+        <footer className="p-8 flex justify-center pointer-events-none">
+          <div className="glass px-8 py-4 rounded-3xl flex items-center gap-4 pointer-events-auto shadow-2xl">
+            <ControlButton active={isMicOn} icon={isMicOn ? <Mic size={22} /> : <MicOff size={22} />} onClick={() => setIsMicOn(!isMicOn)} danger={!isMicOn} label="Mic" />
+            <ControlButton active={isCamOn} icon={isCamOn ? <Video size={22} /> : <VideoOff size={22} />} onClick={() => setIsCamOn(!isCamOn)} danger={!isCamOn} label="Cam" />
+            <div className="h-10 w-px bg-white/10 mx-2" />
+            
+            <ControlButton 
+              active={isRecording} 
+              icon={isRecording ? <CircleStop size={22} /> : <Radio size={22} />} 
+              onClick={isRecording ? stopRecording : startRecording} 
+              danger={isRecording}
+              label={isRecording ? "Stop Rec" : "Record"}
+            />
+
+            <ControlButton 
+              active={isDictating} 
+              icon={isTranscribing ? <Loader2 size={22} className="animate-spin" /> : isDictating ? <Ear size={22} /> : <TypeIcon size={22} />} 
+              onClick={isDictating ? stopDictation : startDictation} 
+              danger={isDictating}
+              label={isTranscribing ? "Translating..." : isDictating ? "Stop Dictate" : "Dictate"}
+            />
+            
+            <ControlButton active={showTranscript} icon={<MessageSquare size={22} />} onClick={() => setShowTranscript(!showTranscript)} label="Chat" />
+            <ControlButton active={isSettingsOpen} icon={<Settings size={22} />} onClick={() => setIsSettingsOpen(true)} label="Settings" />
+            
+            <button onClick={stopSession} disabled={!isActive} className="px-6 py-3 bg-red-500 hover:bg-red-400 text-white rounded-2xl flex items-center gap-2 font-bold shadow-lg shadow-red-500/20 disabled:opacity-30">
+              <PhoneOff size={20} /> Leave
+            </button>
+          </div>
+        </footer>
+      </div>
+
+      {showTranscript && (
+        <aside className="w-80 h-full border-l border-white/5 bg-[#0f172a]/50 flex flex-col animate-in slide-in-from-right duration-300">
+          <div className="p-6 border-b border-white/5 flex items-center justify-between">
+            <h3 className="font-bold text-white flex items-center gap-2"><Globe size={18} className="text-indigo-400" /> Meeting Notes</h3>
+            <div className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-[10px] font-bold border ${isTranslationEnabled ? 'bg-indigo-500/20 text-indigo-400 border-indigo-500/20' : 'bg-white/5 text-white/30 border-transparent'}`}>
+              <Languages size={12} /> {isTranslationEnabled ? 'Auto-Translate' : 'Off'}
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+            {transcript.length === 0 && (
+               <div className="flex flex-col items-center justify-center h-full text-center opacity-20 space-y-3">
+                 <Globe size={40} />
+                 <p className="text-xs max-w-[150px]">Meeting activity and translations will appear here.</p>
+               </div>
+            )}
+            {transcript.map((entry) => (
+              <div key={entry.id} className={`flex flex-col ${entry.role === 'user' ? 'items-end' : 'items-start'}`}>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-white/30 mb-2">
+                  {entry.role === 'user' ? (entry.isTranscription ? 'Dictation' : 'Speaker') : 'Aether AI'}
+                </span>
+                <div className={`p-4 rounded-2xl text-sm leading-relaxed border transition-all ${entry.role === 'user' ? 'bg-indigo-600/10 text-indigo-100 border-indigo-500/20 rounded-tr-none' : 'bg-white/5 text-slate-300 border-white/5 rounded-tl-none'}`}>
+                  {entry.englishTranslation ? (
+                    <>
+                      <div className="text-indigo-400 font-medium mb-2 flex items-center gap-1.5">
+                        <Globe size={12} /> {entry.englishTranslation}
                       </div>
-                   </div>
-                   <button 
-                     type="submit"
-                     disabled={isProcessing}
-                     className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 mt-4"
-                   >
-                     {isProcessing ? (
-                       <div className="animate-spin h-5 w-5 border-2 border-white border-t-transparent rounded-full" />
-                     ) : (
-                       <><Lock size={18} /> Encrypt & Process</>
-                     )}
-                   </button>
-                </form>
-              </div>
-
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                <h3 className="text-sm font-bold text-slate-500 uppercase mb-4 tracking-widest">Network Privacy Breakdown</h3>
-                <div className="h-[200px]">
-                   <ResponsiveContainer width="100%" height="100%">
-                      <PieChart>
-                        <Pie data={stats} dataKey="value" innerRadius={60} outerRadius={80} paddingAngle={5}>
-                          {stats.map((entry, index) => (
-                            <Cell key={`cell-${index}`} fill={entry.color} />
-                          ))}
-                        </Pie>
-                        <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1e293b' }} />
-                      </PieChart>
-                   </ResponsiveContainer>
-                </div>
-                <div className="flex justify-center gap-6 mt-2">
-                   {stats.map(s => (
-                     <div key={s.name} className="flex items-center gap-2 text-xs font-semibold">
-                        <div className="w-2 h-2 rounded-full" style={{ background: s.color }} />
-                        <span className="text-slate-300">{s.name}: {s.value}</span>
-                     </div>
-                   ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Right: Charts and Visualizer */}
-            <div className="lg:col-span-2 space-y-6">
-               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 relative overflow-hidden group">
-                  <div className="absolute top-0 right-0 p-4 opacity-10">
-                     <EyeOff size={120} />
-                  </div>
-                  <div className="relative z-10">
-                    <h3 className="text-xl font-bold text-white mb-2 flex items-center gap-2">
-                       <Server size={20} className="text-indigo-400" /> SMPC Aggregator Status
-                    </h3>
-                    <p className="text-slate-400 text-sm mb-6 max-w-md">Real-time status of independent secure compute nodes participating in the network.</p>
-                    
-                    <div className="grid grid-cols-3 gap-4">
-                       <NodeStatus party="Alpha-Node" status="Operational" latency="12ms" />
-                       <NodeStatus party="Beta-Node" status="Operational" latency="24ms" />
-                       <NodeStatus party="Gamma-Node" status="Operational" latency="18ms" />
+                      <div className="opacity-40 text-[11px] border-t border-white/5 pt-2">
+                        {entry.text}
+                      </div>
+                    </>
+                  ) : (
+                    entry.text
+                  )}
+                  {entry.isTranscription && (
+                    <div className="mt-2 text-[9px] font-bold text-indigo-400/60 uppercase tracking-widest border-t border-indigo-500/10 pt-1">
+                      Gemini 3 Flash Transcription
                     </div>
-                  </div>
-               </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+      )}
 
-               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                  <h3 className="text-sm font-bold text-slate-500 uppercase mb-6 tracking-widest">Global Risk Distribution (Aggregated)</h3>
-                  <div className="h-[280px]">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={MOCK_TIME_DATA}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                        <XAxis dataKey="t" stroke="#475569" fontSize={12} />
-                        <YAxis stroke="#475569" fontSize={12} />
-                        <Tooltip />
-                        <Area type="monotone" dataKey="risk" stroke="#6366f1" fill="rgba(99, 102, 241, 0.1)" strokeWidth={2} />
-                      </AreaChart>
-                    </ResponsiveContainer>
+      {isSettingsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
+          <div className="glass w-full max-w-md rounded-3xl overflow-hidden shadow-2xl">
+            <div className="p-6 border-b border-white/5 flex items-center justify-between">
+              <h3 className="text-lg font-bold text-white flex items-center gap-2"><Sliders className="text-indigo-400" /> AI & Audio Config</h3>
+              <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-white/5 rounded-full"><X className="text-white/60" /></button>
+            </div>
+            
+            <div className="p-6 space-y-8">
+              {/* Noise Cancellation Toggle */}
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-bold text-white/90 uppercase flex items-center gap-2">
+                      <Ear size={14} className="text-indigo-400" /> Real-time Noise Filter
+                    </label>
+                    <span className="text-[10px] text-slate-500">Suppresses background noise for crystal clear audio.</span>
                   </div>
-               </div>
+                  <button 
+                    onClick={() => toggleNoiseCancellation(!isNoiseCancellationEnabled)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${isNoiseCancellationEnabled ? 'bg-indigo-600' : 'bg-slate-800'}`}
+                  >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isNoiseCancellationEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Live Translation (Gemini 3 Flash)</label>
+                  <button 
+                    onClick={() => setIsTranslationEnabled(!isTranslationEnabled)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${isTranslationEnabled ? 'bg-indigo-600' : 'bg-slate-800'}`}
+                  >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isTranslationEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500">Automatically translates all spoken input to English in your transcript sidebar.</p>
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Input Frame Rate</label>
+                  <span className="text-xs font-mono text-indigo-400">{frameRate} FPS</span>
+                </div>
+                <input type="range" min="0.5" max="5" step="0.5" value={frameRate} onChange={(e) => setFrameRate(parseFloat(e.target.value))} className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500" />
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Streaming Quality</label>
+                  <span className="text-xs font-mono text-indigo-400">{Math.round(jpegQuality * 100)}%</span>
+                </div>
+                <input type="range" min="0.1" max="0.9" step="0.1" value={jpegQuality} onChange={(e) => setJpegQuality(parseFloat(e.target.value))} className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500" />
+              </div>
+            </div>
+
+            <div className="p-6 bg-white/5 border-t border-white/5 flex justify-end">
+              <button onClick={() => setIsSettingsOpen(false)} className="px-8 py-3 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-xl transition-all shadow-lg shadow-indigo-600/20">Apply Changes</button>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {activeView === 'transactions' && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden animate-in fade-in slide-in-from-bottom-4">
-             <table className="w-full text-left border-collapse">
-                <thead className="bg-slate-800/50">
-                   <tr>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">TX-ID</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">Amount</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">Risk Score</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">Prediction</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">Probability</th>
-                      <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-widest">Status</th>
-                   </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-800">
-                   {transactions.length === 0 ? (
-                     <tr>
-                        <td colSpan={6} className="px-6 py-20 text-center text-slate-500 italic">No transactions processed in this session.</td>
-                     </tr>
-                   ) : transactions.map(tx => (
-                     <tr key={tx.id} className="hover:bg-slate-800/30 transition-colors">
-                        <td className="px-6 py-4 font-mono text-xs text-indigo-400">{tx.id}</td>
-                        <td className="px-6 py-4 text-sm font-semibold text-white">${tx.amount.toLocaleString()}</td>
-                        <td className="px-6 py-4 text-sm text-slate-400">{tx.deviceRiskScore}%</td>
-                        <td className="px-6 py-4">
-                           <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase ${tx.isFraud ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'}`}>
-                              {tx.isFraud ? 'Fraudulent' : 'Legitimate'}
-                           </span>
-                        </td>
-                        <td className="px-6 py-4 text-sm font-mono">{(tx.probability * 100).toFixed(1)}%</td>
-                        <td className="px-6 py-4">
-                           <div className="flex items-center gap-2 text-xs text-slate-500">
-                              <ShieldCheck size={14} className="text-emerald-500" /> {tx.status}
-                           </div>
-                        </td>
-                     </tr>
-                   ))}
-                </tbody>
-             </table>
-          </div>
-        )}
-
-        {activeView === 'terminal' && (
-          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-6 font-mono text-sm h-[600px] overflow-y-auto flex flex-col-reverse shadow-inner">
-             {terminalLogs.map((log, i) => (
-               <div key={i} className={`mb-2 ${log.includes('ERROR') ? 'text-red-400' : log.includes('PHASE') ? 'text-indigo-400' : 'text-slate-400'}`}>
-                 <span className="opacity-50 mr-2">&gt;</span>{log}
-               </div>
-             ))}
-          </div>
-        )}
-
-        {activeView === 'collaboration' && (
-           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 animate-in zoom-in-95 duration-300">
-              <NodeCard name="Alpha Node" type="Compute" region="US-East" />
-              <NodeCard name="Beta Node" type="Verifier" region="EU-West" />
-              <NodeCard name="Gamma Node" type="Storage" region="Asia-SE" />
-              <div className="md:col-span-3 bg-slate-900/50 border border-slate-800 p-8 rounded-2xl text-center">
-                 <Lock size={32} className="mx-auto text-indigo-400 mb-4" />
-                 <h4 className="text-lg font-bold text-white mb-2">Protocol: Secure Multi-Party Computation</h4>
-                 <p className="text-slate-400 max-w-2xl mx-auto">
-                    The network uses additive secret sharing to decompose sensitive transaction fields into random fragments. No single node possesses sufficient information to reconstruct the original data, ensuring mathematical privacy even if multiple nodes are compromised.
-                 </p>
-              </div>
-           </div>
-        )}
-      </main>
+      <style>{`
+        @keyframes wave { 0%, 100% { height: 20%; } 50% { height: 100%; } }
+        .animate-wave { animation: wave 1s ease-in-out infinite; }
+      `}</style>
     </div>
   );
 }
 
-// Utility Components
-function NavItem({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active: boolean, onClick: () => void }) {
+function ControlButton({ active, icon, onClick, danger, label }: { active: boolean, icon: React.ReactNode, onClick: () => void, danger?: boolean, label: string }) {
   return (
-    <button 
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all border ${
-        active 
-          ? 'bg-indigo-600/10 text-indigo-400 border-indigo-500/20 shadow-inner' 
-          : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50 border-transparent'
-      }`}
-    >
-      {icon}
-      <span className="font-semibold text-sm">{label}</span>
-    </button>
-  );
-}
-
-function NodeStatus({ party, status, latency }: { party: string, status: string, latency: string }) {
-  return (
-    <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl">
-       <div className="text-[10px] font-bold text-slate-500 uppercase mb-1 tracking-tighter">{party}</div>
-       <div className="flex items-center justify-between">
-          <span className="text-xs text-white font-semibold">{status}</span>
-          <span className="text-[10px] font-mono text-indigo-400">{latency}</span>
-       </div>
-       <div className="w-full h-1 bg-slate-800 rounded-full mt-2 overflow-hidden">
-          <div className="h-full bg-indigo-500 w-full animate-pulse" />
-       </div>
+    <div className="flex flex-col items-center gap-1">
+      <button onClick={onClick} className={`p-3 rounded-2xl transition-all border flex items-center justify-center ${active ? 'bg-white/5 text-white border-white/10 hover:bg-white/10' : danger ? 'bg-red-500/10 text-red-400 border-red-500/20 hover:bg-red-500/20' : 'bg-white/5 text-white/40 border-transparent hover:text-white'}`}>
+        {icon}
+      </button>
+      <span className="text-[10px] font-bold uppercase tracking-tighter text-white/40">{label}</span>
     </div>
   );
 }
-
-function NodeCard({ name, type, region }: { name: string, type: string, region: string }) {
-  return (
-    <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl hover:border-indigo-500/40 transition-all group">
-       <div className="flex justify-between items-start mb-4">
-          <div className="bg-indigo-500/10 p-2 rounded-lg text-indigo-400 group-hover:scale-110 transition-transform">
-             <Server size={20} />
-          </div>
-          <div className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500 text-[10px] font-bold border border-emerald-500/20">Active</div>
-       </div>
-       <h4 className="font-bold text-white text-lg">{name}</h4>
-       <div className="mt-4 space-y-2">
-          <div className="flex justify-between text-xs">
-             <span className="text-slate-500">Module</span>
-             <span className="text-slate-300 font-semibold">{type}</span>
-          </div>
-          <div className="flex justify-between text-xs">
-             <span className="text-slate-500">Region</span>
-             <span className="text-slate-300 font-semibold">{region}</span>
-          </div>
-       </div>
-    </div>
-  );
-}
-
-const MOCK_TIME_DATA = [
-  { t: '12:00', risk: 24 }, { t: '13:00', risk: 18 }, { t: '14:00', risk: 35 },
-  { t: '15:00', risk: 42 }, { t: '16:00', risk: 12 }, { t: '17:00', risk: 65 },
-  { t: '18:00', risk: 55 }, { t: '19:00', risk: 32 }, { t: '20:00', risk: 28 },
-];

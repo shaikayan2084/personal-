@@ -2,9 +2,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { BankStats, AnalysisResponse } from "../types";
 
-// Removed global helper to ensure strictly compliant initialization format
 export const analyzeFederatedData = async (aggregatedStats: BankStats[]): Promise<AnalysisResponse> => {
-  // Always use the specified initialization format directly with process.env.API_KEY
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const prompt = `
     As a world-class financial security expert, analyze the following aggregated metrics from multiple banking institutions. 
@@ -32,13 +30,11 @@ export const analyzeFederatedData = async (aggregatedStats: BankStats[]): Promis
     }
   });
 
-  // Directly access .text property from GenerateContentResponse
   const text = response.text || '{}';
   return JSON.parse(text) as AnalysisResponse;
 };
 
 export const predictFraudProbability = async (amount: number, riskScore: number): Promise<{ isFraud: boolean; probability: number; reason: string }> => {
-  // Instantiate GoogleGenAI inside the function as recommended
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const prompt = `
     ML INFERENCE MODE:
@@ -68,7 +64,29 @@ export const predictFraudProbability = async (amount: number, riskScore: number)
     }
   });
 
-  // Directly access .text property
   const text = response.text || '{}';
   return JSON.parse(text);
+};
+
+/**
+ * High-quality audio transcription using Gemini 3 Flash.
+ * This model excels at extracting text from audio modalities.
+ */
+export const transcribeAudio = async (base64Audio: string, mimeType: string): Promise<string> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: {
+        parts: [
+          { inlineData: { data: base64Audio, mimeType: mimeType } },
+          { text: "Please transcribe this audio snippet precisely. Provide only the transcript text without any preamble." }
+        ]
+      },
+    });
+    return response.text?.trim() || "No transcription available.";
+  } catch (error) {
+    console.error("Transcription error:", error);
+    throw error;
+  }
 };
