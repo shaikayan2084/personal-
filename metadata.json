@@ -1,0 +1,6 @@
+{
+  "name": "Sentinel v2 - SMPC Fraud Core",
+  "description": "Enterprise-grade privacy-preserving fraud detection engine using Secure Multi-Party Computation and federated AI inference.",
+  "version": "2.0.0",
+  "requestFramePermissions": []
+}
